@@ -1,0 +1,103 @@
+name: Release
+
+# Release 流水线：仅由推送 v* tag 触发打包并发布。
+# CI 检查由 ci.yml 负责，两者职责分离：平时 push 跑检查、不发版；
+# 想发版时本地 `git tag v0.x.y && git push origin v0.x.y` 即可触发本流水线。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 保留手动触发，用于在不打 tag 的情况下调试打包步骤（不会发布 Release）。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 发版是显式动作：同一 tag 重跑应覆盖而非取消，便于修复部分上传失败。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+    # 仅 tag 触发或手动触发时执行；手动触发不会走发布步骤（见下方 if 守卫）。
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        # 失败也保留缓存，便于按平台重试时增量恢复。
+        with:
+          key: release-windows-x86_64
+          cache-on-failure: true
+
+      # 解析 tag 对应的版本号：tag 触发时直接用 tag 名去掉 v 前缀；
+      # 手动触发时回退到 Cargo.toml 工作区版本（仅用于调试，不发布）。
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -and $tag.StartsWith('v')) {
+            $version = $tag.Substring(1)
+          } else {
+            # 手动触发未带 tag，从 Cargo.toml 读取工作区版本仅用于产物命名。
+            $version = (Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Failed to resolve release version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build release binary
+        run: cargo build --locked --release -p air-desktop --bin air
+
+      # 将 air.exe 打包成 zip 产物，命名带版本号便于区分。
+      - name: Prepare packaged artifact
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $artifactName = "air-windows-x86_64-v${version}.zip"
+          $stagingDir = Join-Path $env:RUNNER_TEMP "air-release"
+          if (Test-Path $stagingDir) {
+            Remove-Item -LiteralPath $stagingDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stagingDir | Out-Null
+          Copy-Item -LiteralPath "target/release/air.exe" -Destination (Join-Path $stagingDir "air.exe")
+          Compress-Archive -LiteralPath (Join-Path $stagingDir "air.exe") -DestinationPath $artifactName -Force
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_name }}
+          if-no-files-found: error
+
+      # 仅 tag 触发时发布 Release；手动触发只构建不发布。
+      # update_release 允许同 tag 重跑覆盖，修复部分上传失败；generate_release_notes 自动汇总 commits。
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Air ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          update_release: true
+          files: ${{ steps.package.outputs.artifact_name }}

@@ -1,0 +1,64 @@
+name: CI
+
+# CI 流水线只做检查与测试，不创建 tag、不发布 Release。
+# 发版打包由 release.yml 在推送 v* tag 时单独触发，两者职责分离。
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rustfmt.toml'
+      - '.github/workflows/ci.yml'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rustfmt.toml'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支的更新会取消并替换旧检查，避免并发 run 浪费额度。
+# 借鉴 OxideTerm/native-package 的并发取消策略。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust workspace (check + fmt + test)
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+
+      # 仅做格式与编译校验，不构建产物；构建留给 release.yml。
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo test
+        run: cargo test --workspace --locked
